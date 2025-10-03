@@ -1,0 +1,881 @@
+using CSV
+using DataFrames
+using Dates
+
+# Performance measurement structure
+mutable struct performance_metrics
+    algorithm::String
+    execution_time::Float64
+    cpu_usage::Float64
+    memory_usage::Float64
+    disk_space_usage::Int64
+    timestamp::String
+end
+
+# Node definition for singly linked list.
+mutable struct Node
+    """A node in a singly linked list, storing a dictionary of key-value pairs and a reference to the next node."""
+    data::Dict{String, String}
+    next::Union{Node, Nothing}
+    function Node(data::Dict{String, String})
+        new(data, nothing)
+    end
+end
+
+# Implementation of singly linked list.
+mutable struct singly_linked_list
+    # head refers to the first node
+    head::Union{Node, Nothing}
+    # tail refers to the last node
+    tail::Union{Node, Nothing}
+    # size refers to the number of nodes
+    size::Int
+    function singly_linked_list()
+        new(nothing, nothing, 0)
+    end
+end
+
+# Append a node to the last of the list.
+function add_node(list::singly_linked_list, data::Dict{String, String})
+    new_node = Node(data)
+    if list.head === nothing
+        list.head = new_node
+        list.tail = new_node
+    else
+        list.tail.next = new_node
+        list.tail = new_node
+    end
+    list.size += 1
+    return new_node
+end
+
+# Remove a node at the specific index.
+function remove_node(list::singly_linked_list, index::Int)
+    if index < 0 || index >= list.size
+        return false
+    end
+    if index == 0
+        list.head = list.head.next
+        if list.head === nothing
+            list.tail = nothing
+        end
+        list.size -= 1
+        return true
+    end
+    current = list.head
+    for _ in 1:(index - 1)
+        current = current.next
+    end
+    current.next = current.next.next
+    if current.next === nothing
+        list.tail = current
+    end
+    list.size -= 1
+    return true
+end
+
+"""Return the node at the given index (0-based). Returns nothing if the index is invalid."""
+function get_node_at(list::singly_linked_list, index::Int)
+    if index < 0 || index >= list.size
+        return nothing
+    end
+    current = list.head
+    for _ in 1:index
+        current = current.next
+    end
+    return current
+end
+
+# Print all the nodes in the linked list.
+function display_list(list::singly_linked_list)
+    current = list.head
+    while current !== nothing
+        println(current.data)
+        current = current.next
+    end
+end
+
+# Memory database built on a singly linked list backed by CSV file.
+mutable struct memory_database
+    csv_file::String
+    data_list::singly_linked_list
+    last_modified_time::Float64
+    headers::Vector{String}
+    performance_logs::Vector{performance_metrics}
+    function memory_database(csv_file::String)
+        new(csv_file, singly_linked_list(), 0.0, String[], performance_metrics[])
+    end
+end
+
+# Recursive function to load CSV data into linked list.
+function load_csv(db::memory_database, rows::Vector{Vector{String}}, index::Int)
+    if index > length(rows)
+        return
+    end
+
+    row = rows[index]
+    # Create dictionary with headers as keys.
+    row_data = Dict{String,String}()
+    for (i, h) in enumerate(db.headers)
+        if i <= length(row)
+            row_data[h] = row[i]
+        else
+            row_data[h] = ""
+        end
+    end
+    add_node(db.data_list, row_data)
+    load_csv(db, rows, index + 1)
+end
+
+# Recursive function to load data from CSV file.
+function load_data(db::memory_database)
+    if !isfile(db.csv_file)
+        println("CSV file not found: ", db.csv_file)
+        return
+    end
+    rows = CSV.File(db.csv_file; header=false) |> collect
+    if isempty(rows)
+        println("CSV file is empty")
+        return
+    end
+
+    # first row = headers
+    db.headers = [string(x) for x in rows[1]]
+    data_rows = [Vector{String}(string.(row)) for row in rows[2:end]]
+
+    db.data_list = singly_linked_list()
+    if !isempty(data_rows)
+        load_csv(db, data_rows, 1)
+    end
+
+    db.last_modified_time = stat(db.csv_file).mtime
+    println("Successfully loaded $(db.data_list.size) records from $(db.csv_file)")
+end
+
+# Recursively write linked list nodes to an open CSV file handle.
+function export_csv(io::IO, node::Union{Node,Nothing}, headers::Vector{String})
+    if node === nothing
+        return
+    end
+    row = [get(node.data, h, "") for h in headers]
+    println(io, join(row, ","))
+    export_csv(io, node.next, headers)
+end
+
+# Export the linked list to a CSV file with headers and data.
+function export_to_csv(db::memory_database, output_file::String="julia_result.csv")
+    if isempty(db.headers)
+        println("No data to export")
+        return
+    end
+    open(output_file, "w") do io
+        println(io, join(db.headers, ","))
+        export_csv(io, db.data_list.head, db.headers)
+    end
+    println("Exported $(db.data_list.size) records to $output_file")
+end
+
+# Print the database contents with headers and row values.
+function display_data(db::memory_database)
+    println("\nCurrent Memory Database Contents:")
+    println("Total records: ", db.data_list.size)
+    if !isempty(db.headers)
+        println(join(db.headers, " | "))
+    end
+    current = db.data_list.head
+    while current !== nothing
+        row_data = current.data
+        row_values = [get(current.data, h, "") for h in db.headers]
+        println(join(row_values, " | "))
+        current = current.next
+    end
+end
+
+# Check for the modification of underlying CSV.
+function check_changes(db::memory_database)
+    if !isfile(db.csv_file)
+        return false
+    end
+    current_modified = stat(db.csv_file).mtime
+    if current_modified > db.last_modified_time
+        println("CSV file changed. Reloading data.")
+        load_data(db)
+        export_to_csv(db, "julia_result.csv")
+        return true
+    end
+    return false
+end
+
+"""Continuously monitor the CSV file for changes at interval seconds. Reloads data if changes are detected."""
+function monitor_changes(db::memory_database, interval::Int)
+    println("Monitoring $(db.csv_file) for changes. (Ctrl+C to stop)")
+    while true
+        check_changes(db)
+        sleep(interval)
+    end
+end
+
+# Prompt the user to enter values for each column header and append a new row to the linked list.
+function add_row(db::memory_database)
+    if isempty(db.headers)
+        println("No headers available. Load data first.")
+        return
+    end
+    row_data = Dict{String,String}()
+    for h in db.headers
+        print("Enter $h: ")
+        value = readline()
+        row_data[h] = value
+    end
+    add_node(db.data_list, row_data)
+    export_to_csv(db, "julia_result.csv")
+    println("Row added to memory database")
+end
+
+# Prompt the user for a row index and remove that row from the database.
+function remove_row(db::memory_database)
+    if db.data_list.size == 0
+        println("No records to remove.")
+        return
+    end
+    print("Enter row number to remove (0-$(db.data_list.size-1)): ")
+    index = parse(Int, readline())
+    if index < 0 || index >= db.data_list.size
+        println("Invalid row number.")
+        return
+    end
+    row_data = get_node_at(db.data_list, index)
+    row_values = [get(row_data.data, header, "") for header in db.headers]
+    println("Record to be removed: ", join(row_values, " | "))
+    print("Are you sure you want to remove this record? (y/n): ")
+    confirm = lowercase(readline())
+    if confirm == "y"
+        if remove_node(db.data_list, index)
+            export_to_csv(db, "julia_result.csv")
+            println("Record removed successfully.")
+        end
+    end
+end
+# Recursive function to validate whether the specified column exist in headers or not.
+function validate_key(db::memory_database, key::AbstractString)
+    if db.headers === nothing || !(String(key) in db.headers)
+        println("Error: Column '$key' is not found in CSV headers.")
+        if db.headers !== nothing
+            println("Available Columns: $(join(db.headers, ", "))")
+        end
+        return false
+    end
+    return true
+end
+
+# Helper function for comparison
+function compare_values(a::String, b::String, order::String="ASC")
+    # Try to convert to numeric for proper comparison
+    try
+        val1 = isempty(a) ? 0.0 : parse(Float64, a)
+        val2 = isempty(b) ? 0.0 : parse(Float64, b)
+        if order == "ASC"
+            return val1 <= val2
+        else
+            return val1 >= val2
+        end
+    catch
+        # If conversion fails to numeric, compare as strings
+        if order == "ASC"
+            return a <= b
+        else
+            return a >= b
+        end
+    end
+end
+
+# Recursive function to implement the bubble sort for the linked list.
+function bubble_sort(db::memory_database, key::String, order::String="ASC")
+    if !validate_key(db, String(key))
+        return false
+    end
+    if db.data_list.size <= 1
+        println("Not enough data to sort.")
+        return true
+    end
+    # Convert linked list to array for easier sorting
+    nodes = Node[]
+    current = db.data_list.head
+    while current !== nothing
+        push!(nodes, current)
+        current = current.next
+    end
+    # Bubble sort algorithm
+    n = length(nodes)
+    for i in 1:n-1
+        swapped = false
+        for j in 1:n-i
+            # Handle missing keys by treating them as empty strings
+            value1 = get(nodes[j].data, key, "")
+            value2 = get(nodes[j+1].data, key, "")
+            if !compare_values(value1, value2, order)
+                nodes[j].data, nodes[j+1].data = nodes[j+1].data, nodes[j].data
+                swapped = true
+            end
+        end
+        if !swapped
+            break
+        end
+    end
+    println("Bubble sort completed on column: $key ($order)")
+    return true
+end
+
+# Recursive function to implement the insertion sort for the linked list.
+function insertion_sort(db::memory_database, key::String, order::String="ASC")
+    if !validate_key(db, String(key))
+        return false
+    end
+    if db.data_list.size <= 1
+        println("Not enough data to sort.")
+        return true
+    end
+    # Convert to array for sorting as we are using a singly linked list
+    nodes = Node[]
+    current = db.data_list.head
+    while current !== nothing
+        push!(nodes, current)
+        current = current.next
+    end
+    # Insertion sort algorithm
+    for i in 2:length(nodes)
+        j = i
+        while j > 1
+            value1 = get(nodes[j-1].data, key, "")
+            value2 = get(nodes[j].data, key, "")
+            if !compare_values(value1, value2, order)
+                nodes[j-1].data, nodes[j].data = nodes[j].data, nodes[j-1].data
+                j -= 1
+            else
+                break
+            end
+        end
+    end
+    println("Insertion sort completed on column: $key ($order)")
+    return true
+end
+
+# Merge sort implementation for linked list
+function merge_sort(db::memory_database, key::String, order::String="ASC")
+    if !validate_key(db, String(key))
+        return false
+    end
+    if db.data_list.size <= 1
+        println("Not enough data to sort.")
+        return true
+    end
+    # Convert linked list to array for easier sorting
+    nodes = Node[]
+    current = db.data_list.head
+    while current !== nothing
+        push!(nodes, current)
+        current = current.next
+    end
+    
+    # Recursive merge sort function
+    function merge_sort_recursive(arr::Vector{Node})
+        if length(arr) <= 1
+            return arr
+        end
+        
+        mid = length(arr) ÷ 2
+        left = merge_sort_recursive(arr[1:mid])
+        right = merge_sort_recursive(arr[mid+1:end])
+        
+        return merge(left, right)
+    end
+    
+    # Merge function
+    function merge(left::Vector{Node}, right::Vector{Node})
+        result = Node[]
+        i = 1
+        j = 1
+        
+        while i <= length(left) && j <= length(right)
+            value1 = get(left[i].data, key, "")
+            value2 = get(right[j].data, key, "")
+            
+            if compare_values(value1, value2, order)
+                push!(result, left[i])
+                i += 1
+            else
+                push!(result, right[j])
+                j += 1
+            end
+        end
+        
+        # Append remaining elements
+        while i <= length(left)
+            push!(result, left[i])
+            i += 1
+        end
+        
+        while j <= length(right)
+            push!(result, right[j])
+            j += 1
+        end
+        
+        return result
+    end
+    
+    # Perform merge sort
+    sorted_nodes = merge_sort_recursive(nodes)
+    
+    # Update the linked list with sorted nodes
+    db.data_list = singly_linked_list()
+    for node in sorted_nodes
+        add_node(db.data_list, node.data)
+    end
+    
+    println("Merge sort is implemented on column: $key")
+    return true
+end
+
+# Quick sort implementation for linked list
+function quick_sort(db::memory_database, key::String, order::String="ASC")
+    if !validate_key(db, String(key))
+        return false
+    end
+    if db.data_list.size <= 1
+        println("Not enough data to sort.")
+        return true
+    end
+    
+    # Convert linked list to array for easier sorting
+    nodes = Node[]
+    current = db.data_list.head
+    while current !== nothing
+        push!(nodes, current)
+        current = current.next
+    end
+    
+    # Recursive quick sort function
+    function quick_sort_recursive(arr::Vector{Node})
+        if length(arr) <= 1
+            return arr
+        end
+        
+        pivot_index = length(arr) ÷ 2
+        pivot = arr[pivot_index]
+        pivot_value = get(pivot.data, key, "")
+        
+        left = Node[]
+        right = Node[]
+        
+        for (i, node) in enumerate(arr)
+            if i != pivot_index
+                node_value = get(node.data, key, "")
+                if compare_values(node_value, pivot_value, order)
+                    push!(left, node)
+                else
+                    push!(right, node)
+                end
+            end
+        end
+        
+        return vcat(quick_sort_recursive(left), [pivot], quick_sort_recursive(right))
+    end
+    
+    # Perform quick sort
+    sorted_nodes = quick_sort_recursive(nodes)
+    
+    # Update the linked list with sorted nodes
+    db.data_list = singly_linked_list()
+    for node in sorted_nodes
+        add_node(db.data_list, node.data)
+    end
+    
+    println("Quick sort is implemented on column: $key")
+    return true
+end
+
+# Recursive function to choose a column from header for implementing the sorting algorithm.
+function choose_sort_key(db::memory_database)
+    if isempty(db.headers)
+        println("No data is available. Please load the data first.")
+        return nothing
+    end
+    println("\nAvailable columns: $(join(db.headers, ", "))")
+    print("Enter a column name to sort: ")
+    key_input = readline()
+    key = string(strip(key_input))  # Convert to String explicitly
+    
+    if !(key in db.headers)
+        println("Error: '$key' is not a valid column name.")
+        return nothing
+    end
+    return key
+end
+
+# Function to choose sorting order
+function choose_sort_order()
+    println("\nChoose sorting order:")
+    println("1. Ascending (ASC)")
+    println("2. Descending (DSC)")
+    print("Enter your choice (1 or 2): ")
+    order_choice = strip(readline())
+    if order_choice == "1" || order_choice == "asc" || order_choice == "ASC"
+        return "ASC"
+    elseif order_choice == "2" || order_choice == "dsc" || order_choice == "DSC"
+        return "DSC"
+    else
+        println("Invalid choice. Using Ascending as default.")
+        return "ASC"
+    end
+end
+
+# Function that gives the options of sorting algorithm to implement.
+function opt_sorting_algorithm()
+    println("\nChoose sorting algorithm for implementation in memory database:")
+    println("1. Bubble Sort")
+    println("2. Insertion Sort")
+    println("3. Merge Sort")
+    println("4. Quick Sort")
+    println("5. Compare All Algorithms (Computational Performance)")
+    println("6. Execute SQL Query")
+    print("Enter your choice (1, 2, 3, 4, 5 or 6): ")
+    algorithm_choice = strip(readline())
+    if algorithm_choice == "1"
+        return "bubble"
+    elseif algorithm_choice == "2"
+        return "insertion"
+    elseif algorithm_choice == "3"
+        return "merge"
+    elseif algorithm_choice == "4"
+        return "quick"
+    elseif algorithm_choice == "5"
+        return "compare"
+    elseif algorithm_choice == "6"
+        return "sql"
+    else
+        println("Invalid choice. Using Bubble Sort as default.")
+        return "bubble"
+    end
+end
+
+# Recursive function to export the sorted data to CSV.
+function export_sorted_csv(db::memory_database, output_file::String, sort_type::String, key::Union{String, Nothing}=nothing, order::String="ASC")
+    if key === nothing
+        key = choose_sort_key(db)
+        if key === nothing
+            return false
+        end
+    end
+    if !validate_key(db, key)
+        return false
+    end
+    if sort_type == "bubble"
+        bubble_sort(db, String(key),order)
+    elseif sort_type == "insertion"
+        insertion_sort(db, String(key), order)
+    elseif sort_type == "merge"
+        merge_sort(db, String(key), order)
+    elseif sort_type == "quick"
+        quick_sort(db, String(key), order)
+    else
+        println("Sort type is invalid. Please use bubble/insertion/merge/quick sort.")
+        return
+    end
+    export_to_csv(db, output_file)
+    println("Sorted data exported to $output_file using $sort_type sort on column: $key")
+    return true
+end
+
+"Dispatcher to call the correct sorting algorithm"
+function sort_database(db::memory_database, key::String, order::String, method::String)
+    if method == "bubble_sort"
+        return bubble_sort(db, key, order)
+    elseif method == "insertion_sort"
+        return insertion_sort(db, key, order)
+    elseif method == "merge_sort"
+        return merge_sort(db, key, order)
+    elseif method == "quick_sort"
+        return quick_sort(db, key, order)
+    else
+        println("Unknown sorting method: $method")
+        return false
+    end
+end
+
+"Compare performance of different sorting algorithms"
+function compare_sorting_performance(db::memory_database, key::String)
+    methods = ["bubble_sort", "insertion_sort", "merge_sort", "quick_sort"]
+    for m in methods
+        println("\n--- $m ---")
+        db_copy = memory_database(db.csv_file)
+        load_data(db_copy)
+        t_start = time()
+        sort_database(db_copy, key, "ASC", m)
+        t_end = time()
+        exec_time = t_end - t_start
+        println("Execution time for $m: $exec_time seconds")
+
+        # Capture CPU & disk usage (Linux)
+        try
+            run(`vmstat 1 2`)
+            run(`iostat -dx 1 2`)
+            run(`pidstat 1 2`)
+            run(`df -h`)
+        catch e
+            println("System metrics collection failed: $e")
+        end
+    end
+end
+
+# SQL Query Parser Function
+function parse_sql_query(db::memory_database, query::String)
+    try
+        # Convert to uppercase for case-insensitive parsing of keywords only
+        query_upper = uppercase(strip(query))
+        
+        # Remove extra spaces and parse
+        query_upper = replace(query_upper, r"\s+" => " ")
+        
+        # Parse the SQL-like query
+        # Expected format: SELECT columns FROM t1 ORDER BY column ASC/DSC WITH algorithm
+        
+        # Extract select clause
+        if !startswith(query_upper, "SELECT ")
+            println("Error: Query must start with SELECT")
+            return false
+        end
+        
+        # Extract from clause
+        from_index = findfirst(" FROM ", query_upper)
+        if from_index === nothing
+            println("Error: Missing FROM clause")
+            return false
+        end
+        
+        # Extract order by clause
+        order_by_index = findfirst(" ORDER BY ", query_upper)
+        if order_by_index === nothing
+            println("Error: Missing ORDER BY clause")
+            return false
+        end
+        
+        # Extract with clause
+        with_index = findfirst(" WITH ", query_upper)
+        if with_index === nothing
+            println("Error: Missing WITH clause")
+            return false
+        end
+        
+        # Extract components - use original case for column names
+        columns_part = query[8:from_index.start-1]  # After "SELECT " (original case)
+        from_part = query_upper[from_index.start+6:order_by_index.start-1]  # After "FROM "
+        order_by_part = query[order_by_index.start+10:with_index.start-1]  # After "ORDER BY " (original case)
+        with_part = query_upper[with_index.start+6:end]  # After "with"
+        
+        # Parse columns - preserve original case
+        columns_str = strip(columns_part)
+        selected_columns = if uppercase(columns_str) == "*"
+            db.headers
+        else
+            [strip(col) for col in split(columns_str, ",")]
+        end
+        
+        # Validate table name
+        table_name = strip(from_part)
+        if table_name != "T1"
+            println("Error: Unknown table '$table_name'. Only 'T1' is supported.")
+            return false
+        end
+        
+        # Parse ORDER BY clause - preserve original case for column name
+        order_parts = split(strip(order_by_part), " ")
+        if length(order_parts) < 2
+            println("Error: Invalid ORDER BY clause. Expected: column ASC/DSC")
+            return false
+        end
+        
+        sort_column = strip(order_parts[1])  # Keep original case
+        sort_order = uppercase(strip(order_parts[2]))  # Convert to uppercase for order
+        
+        if sort_order != "ASC" && sort_order != "DSC"
+            println("Error: Invalid sort order '$sort_order'. Use ASC or DSC.")
+            return false
+        end
+        
+        # Parse algorithm
+        algorithm = strip(with_part)
+        valid_algorithms = ["BUBBLE_SORT", "INSERTION_SORT", "MERGE_SORT", "QUICK_SORT"]
+        if !(algorithm in valid_algorithms)
+            println("Error: Invalid algorithm '$algorithm'. Use: $(join(valid_algorithms, ", "))")
+            return false
+        end
+        
+        # Validate columns - use case-insensitive comparison
+        for col in selected_columns
+            col_normalized = lowercase(strip(col))
+            if !any(lowercase(h) == col_normalized for h in db.headers)
+                println("Error: Column '$col' is not found in CSV headers.")
+                println("Available Columns: $(join(db.headers, ", "))")
+                return false
+            end
+        end
+        
+        # Validate sort column with case-insensitive comparison
+        sort_column_normalized = lowercase(sort_column)
+        if !any(lowercase(h) == sort_column_normalized for h in db.headers)
+            println("Error: Column '$sort_column' is not found in CSV headers.")
+            println("Available Columns: $(join(db.headers, ", "))")
+            return false
+        end
+        
+        # Find the actual column name from headers (case-sensitive)
+        actual_sort_column = db.headers[findfirst(h -> lowercase(h) == sort_column_normalized, db.headers)]
+        
+        # Map algorithm name to function type
+        algo_map = Dict(
+            "BUBBLE_SORT" => "bubble",
+            "INSERTION_SORT" => "insertion", 
+            "MERGE_SORT" => "merge",
+            "QUICK_SORT" => "quick"
+        )
+        
+        algo_type = algo_map[algorithm]
+        
+        # Execute the sort
+        println("\nExecuting SQL Query:")
+        println("Columns: $(join(selected_columns, ", "))")
+        println("Sort by: $actual_sort_column $sort_order")
+        println("Algorithm: $algorithm")
+        
+        # Create a copy for sorting to preserve original data
+        db_copy = memory_database(db.csv_file)
+        load_data(db_copy)
+        
+        # Perform sorting using actual column name
+        if algo_type == "bubble"
+            bubble_sort(db_copy, actual_sort_column, sort_order)
+        elseif algo_type == "insertion"
+            insertion_sort(db_copy, actual_sort_column, sort_order)
+        elseif algo_type == "merge"
+            merge_sort(db_copy, actual_sort_column, sort_order)
+        elseif algo_type == "quick"
+            quick_sort(db_copy, actual_sort_column, sort_order)
+        end
+
+        # Export result
+        output_file = "julia_sql_result.csv"
+        export_to_csv(db_copy, output_file)
+        # Display selected columns from sorted data
+        println("\nQuery Results (first 10 rows):")
+        # Find actual column names for display
+        display_columns = []
+        for col in selected_columns
+            col_normalized = lowercase(strip(col))
+            actual_col = db.headers[findfirst(h -> lowercase(h) == col_normalized, db.headers)]
+            push!(display_columns, actual_col)
+        end
+        println(join(display_columns, " | "))
+        
+        current = db_copy.data_list.head
+        count = 0
+        while current !== nothing && count < 10
+            row_values = [get(current.data, col, "") for col in display_columns]
+            println(join(row_values, " | "))
+            current = current.next
+            count += 1
+        end
+        
+        if count == 10
+            println("(Showing first 10 rows only)")
+        end
+        
+        println("\nFull results exported to: $output_file")
+        return true
+    catch e
+        println("Error parsing SQL query: $e")
+        println("Expected format: SELECT columns FROM t1 ORDER BY column ASC/DSC WITH algorithm")
+        return false
+    end
+end
+
+# Interactive SQL query interface
+function sql_query_interface(db::memory_database)
+    println("SQL Query Interface")
+    println("Supported syntax:")
+    println("SELECT column1, column2 FROM t1 ORDER BY column_name ASC WITH BUBBLE_SORT")
+    println("SELECT * FROM t1 ORDER BY age DSC WITH QUICK_SORT")
+    println("Available algorithms: BUBBLE_SORT, INSERTION_SORT, MERGE_SORT, QUICK_SORT")
+    println("Type 'exit' to return to main menu")
+    while true
+        print("\nSQL> ")
+        query = readline()
+        if lowercase(query) == "exit"
+            break
+        elseif isempty(strip(query))
+            continue
+        end
+        parse_sql_query(db, query)
+    end
+end
+
+# Main Execution
+function main()
+    # Initialize the memory database
+    db = memory_database("student-data.csv")
+
+    # Load initial data
+    load_data(db)
+
+    # Display loaded data
+    display_data(db)
+
+    # Export to new CSV
+    export_to_csv(db, "julia_result.csv")
+
+    # Main interactive loop
+    while true
+        # Ask user to choose a sorting algorithm
+        sort_type = opt_sorting_algorithm()
+        if sort_type == "bubble"
+            key = choose_sort_key(db)
+            if key !== nothing
+                order = choose_sort_order()
+                export_sorted_csv(db, "julia_bubble_sort.csv", "bubble", key, order)
+            end
+        elseif sort_type == "insertion"
+            key = choose_sort_key(db)
+            if key !== nothing
+                order = choose_sort_order()
+                export_sorted_csv(db, "julia_insertion_sort.csv", "insertion", key, order)
+            end
+        elseif sort_type == "merge"
+            key = choose_sort_key(db)
+            if key !== nothing
+                order = choose_sort_order()
+                export_sorted_csv(db, "julia_merge_sort.csv", "merge", key, order)
+            end
+        elseif sort_type == "quick"
+            key = choose_sort_key(db)
+            if key !== nothing
+                order = choose_sort_order()
+                export_sorted_csv(db, "julia_quick_sort.csv", "quick", key, order)
+            end
+        elseif sort_type == "compare"
+            key = choose_sort_key(db)
+            if key !== nothing
+                compare_sorting_performance(db, key)
+            end
+        elseif sort_type == "sql"
+            sql_query_interface(db)
+        else
+            println("Invalid selection.")
+        end
+        # Ask if user wants to continue
+        println("\nDo you want to perform another operation? (y/n): ")
+        continue_choice = lowercase(strip(readline()))
+        if continue_choice != "y" && continue_choice != "yes"
+            break
+        end
+    end
+end
+main()
